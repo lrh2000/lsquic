@@ -768,7 +768,11 @@ send_ctl_select_cc (struct lsquic_send_ctl *ctl)
 
     srtt = lsquic_rtt_stats_get_srtt(&ctl->sc_conn_pub->rtt_stats);
 
+#if 0
     if (srtt <= ctl->sc_enpub->enp_settings.es_cc_rtt_thresh)
+#else
+    if (0)
+#endif
     {
         LSQ_INFO("srtt is %"PRIu64" usec, which is smaller than or equal to "
             "the threshold of %u usec: select Cubic congestion controller",

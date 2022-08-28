@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/queue.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <time.h>
 
 #ifndef WIN32
@@ -31,6 +33,10 @@
 
 #include "../src/liblsquic/lsquic_byteswap.h"
 #include "../src/liblsquic/lsquic_logger.h"
+#include "../src/liblsquic/lsquic_xperf.h"
+
+#include "../xperf/xperf_monitor.h"
+#include "../xperf/xperf_quic.h"
 
 
 static lsquic_conn_ctx_t *
@@ -55,6 +61,13 @@ struct lsquic_stream_ctx
         unsigned char   buf[sizeof(uint64_t)];  /* Read client header in */
     }                   u;
     unsigned            n_h_read;   /* Number of header bytes read in */
+};
+
+
+struct lsquic_monitor_ctx
+{
+    struct xperf_monitor *monitor;
+    struct event         *event;
 };
 
 
@@ -164,6 +177,38 @@ buffer_read (void *lsqr_ctx, void *buf, size_t count)
 }
 
 
+static ssize_t
+perf_stream_write_chunks(struct lsquic_stream *stream)
+{
+    struct lsquic_xperf_chunk *chunk;
+    size_t chunk_size, chunk_offset;
+    ssize_t written_size, total_written_size;
+
+    total_written_size = 0;
+    do {
+        chunk = STAILQ_FIRST(&g_xperf_state->chunks);
+        chunk_size = chunk->chunk[0].size;
+        chunk_offset = g_xperf_state->data_off;
+
+        written_size = lsquic_stream_write(stream, (void *)&chunk->chunk[0] + chunk_offset, chunk_size - chunk_offset);
+        if (written_size < 0)
+            return written_size;
+        total_written_size += written_size;
+        if ((size_t)written_size != chunk_size - chunk_offset)
+        {
+            g_xperf_state->data_off += written_size;
+            break;
+        }
+
+        STAILQ_REMOVE_HEAD(&g_xperf_state->chunks, next);
+        free(chunk);
+        g_xperf_state->data_off = 0;
+    } while (!STAILQ_EMPTY(&g_xperf_state->chunks));
+
+    return total_written_size;
+}
+
+
 static void
 perf_server_on_write (struct lsquic_stream *stream,
                                         struct lsquic_stream_ctx *stream_ctx)
@@ -171,8 +216,16 @@ perf_server_on_write (struct lsquic_stream *stream,
     struct lsquic_reader reader;
     ssize_t nw;
 
-    reader = (struct lsquic_reader) { buffer_read, buffer_size, stream_ctx, };
-    nw = lsquic_stream_writef(stream, &reader);
+    if (!g_xperf_state || STAILQ_EMPTY(&g_xperf_state->chunks))
+    {
+        reader = (struct lsquic_reader) { buffer_read, buffer_size, stream_ctx, };
+        nw = lsquic_stream_writef(stream, &reader);
+    }
+    else
+    {
+        nw = perf_stream_write_chunks(stream);
+    }
+
     if (nw >= 0)
         LSQ_DEBUG("%s: wrote %zd bytes", __func__, nw);
     else
@@ -188,6 +241,158 @@ perf_server_on_close (lsquic_stream_t *stream, lsquic_stream_ctx_t *stream_ctx)
 {
     LSQ_DEBUG("stream closed");
     free(stream_ctx);
+}
+
+
+static int64_t
+calculate_clock_offset (void)
+{
+    struct timespec tp, wall_tp;
+    uint64_t ts, wall_ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &tp) < 0)
+    {
+        LSQ_ERROR("calculate_clock_offset: clock_gettime(MONOTONIC): %s", strerror(errno));
+        return 0;
+    }
+
+    if (clock_gettime(CLOCK_REALTIME, &wall_tp) < 0)
+    {
+        LSQ_ERROR("calculate_clock_offset: clock_gettime(REALTIME): %s", strerror(errno));
+        return 0;
+    }
+
+    ts = (uint64_t)tp.tv_sec * 1000000 + tp.tv_nsec / 1000;
+    wall_ts = (uint64_t)wall_tp.tv_sec * 1000000 + wall_tp.tv_nsec / 1000;
+
+    return wall_ts - ts;
+}
+
+
+static struct lsquic_xperf_state *
+perf_xperf_state_create (const char *dirname)
+{
+    struct lsquic_xperf_state *state;
+    int dirfd, fd_qdat, fd_qack;
+    FILE *fp_qdat, *fp_qack;
+
+    dirfd = dirname ? open(dirname, __O_PATH) : AT_FDCWD;
+    if (dirname && dirfd < 0)
+    {
+        LSQ_ERROR("perf_xperf_state_create: open(%s): %s\n",
+              dirname, strerror(errno));
+        return NULL;
+    }
+
+    fd_qdat = openat(dirfd, XPERF_QUIC_DATA_NAME, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd_qdat < 0)
+    {
+        LSQ_ERROR("perf_xperf_state_create: openat(%s): %s\n",
+              XPERF_QUIC_DATA_NAME, strerror(errno));
+        close(dirfd);
+        return NULL;
+    }
+
+    fd_qack = openat(dirfd, XPERF_QUIC_ACK_NAME, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd_qack < 0)
+    {
+        LSQ_ERROR("perf_xperf_state_create: openat(%s): %s\n",
+              XPERF_QUIC_ACK_NAME, strerror(errno));
+        close(fd_qdat);
+        return NULL;
+    }
+
+    close(dirfd);
+
+    fp_qdat = fdopen(fd_qdat, "w");
+    if (!fp_qdat)
+    {
+        LSQ_ERROR("perf_xperf_state_create: fdopen(%s): %s\n",
+              XPERF_QUIC_DATA_NAME, strerror(errno));
+        close(fd_qdat);
+        close(fd_qack);
+        return NULL;
+    }
+
+    fp_qack = fdopen(fd_qack, "w");
+    if (!fp_qack)
+    {
+        LSQ_ERROR("perf_xperf_state_create: fdopen(%s): %s\n",
+              XPERF_QUIC_ACK_NAME, strerror(errno));
+        close(fd_qack);
+        fclose(fp_qdat);
+        return NULL;
+    }
+
+    state = malloc(sizeof(struct lsquic_xperf_state));
+    if (!state)
+    {
+        LSQ_ERROR("perf_xperf_state_create: malloc: Out of memory");
+        fclose(fp_qdat);
+        fclose(fp_qack);
+        return NULL;
+    }
+
+    STAILQ_INIT(&state->chunks);
+
+    state->data_off = 0;
+    if ((state->stamp_off = calculate_clock_offset()) == 0)
+    {
+        fclose(fp_qdat);
+        fclose(fp_qack);
+        free(state);
+        return NULL;
+    }
+
+    state->fp_qdat = fp_qdat;
+    state->fp_qack = fp_qack;
+
+    return state;
+}
+
+
+static void
+perf_xperf_state_destory (struct lsquic_xperf_state *state)
+{
+    fclose(state->fp_qdat);
+    fclose(state->fp_qack);
+
+    free(state);
+}
+
+
+static ssize_t
+perf_xperf_emit_chunk (void *ctx, const void *data, size_t len)
+{
+    struct lsquic_xperf_chunk *chunk;
+
+    chunk = (void *)data - sizeof(struct lsquic_xperf_chunk);
+    assert(chunk->chunk[0].size == len);
+
+    STAILQ_INSERT_TAIL(&g_xperf_state->chunks, chunk, next);
+
+    return len;
+}
+
+
+static void
+perf_xperf_monitor_cb (evutil_socket_t fd, short what, void *ctx_)
+{
+    struct lsquic_monitor_ctx *ctx;
+
+    ctx = (struct lsquic_monitor_ctx *)ctx_;
+
+    if (xperf_monitor_process(ctx->monitor) > 0)
+        event_add(ctx->event, NULL);
+}
+
+
+static void *
+perf_xperf_alloc (size_t len)
+{
+    void *base;
+    base = malloc(len + sizeof(struct lsquic_xperf_chunk));
+    return base + sizeof(struct lsquic_xperf_chunk);
 }
 
 
@@ -208,8 +413,12 @@ usage (const char *prog)
     if (slash)
         prog = slash + 1;
     printf(
-"Usage: %s [opts]\n"
+"Usage: %s [opts] [FILES...]\n"
 "\n"
+"Options:\n"
+"   FILES...    Transfer FILES into clients while running performance tests\n"
+"   -d DIR      Log internal BBR indicators into files located at DIR.  If\n"
+"                 not specified, use the current working directory.\n"
                 , prog);
 }
 
@@ -220,13 +429,19 @@ main (int argc, char **argv)
     int opt, s;
     struct prog prog;
     struct sport_head sports;
+    struct lsquic_monitor_ctx mctx;
+    const char *dirname;
 
     TAILQ_INIT(&sports);
     prog_init(&prog, LSENG_SERVER, &sports, &perf_server_stream_if, NULL);
 
-    while (-1 != (opt = getopt(argc, argv, PROG_OPTS "h")))
+    dirname = NULL;
+    while (-1 != (opt = getopt(argc, argv, PROG_OPTS "hd:")))
     {
         switch (opt) {
+        case 'd':
+            dirname = optarg;
+            break;
         case 'h':
             usage(argv[0]);
             prog_print_common_options(&prog, stdout);
@@ -237,17 +452,51 @@ main (int argc, char **argv)
         }
     }
 
+    g_xperf_state = perf_xperf_state_create(dirname);
+    if (!g_xperf_state)
+        exit(EXIT_FAILURE);
+
+    mctx.monitor = xperf_monitor_create(O_NONBLOCK, (const char **)&argv[optind],
+                                        argc - optind, &perf_xperf_emit_chunk,
+                                        NULL, &perf_xperf_alloc);
+    if (!mctx.monitor)
+    {
+        perf_xperf_state_destory(g_xperf_state);
+        exit(EXIT_FAILURE);
+    }
+
     add_alpn("perf");
     if (0 != prog_prep(&prog))
     {
         LSQ_ERROR("could not prep");
+        xperf_monitor_destory(mctx.monitor);
+        perf_xperf_state_destory(g_xperf_state);
         exit(EXIT_FAILURE);
     }
+
+    mctx.event = event_new(prog_eb(&prog), mctx.monitor->watch_fd,
+                           EV_READ, &perf_xperf_monitor_cb, &mctx);
+    if (!mctx.event)
+    {
+        LSQ_ERROR("could not create ev");
+        prog_cleanup(&prog);
+        xperf_monitor_destory(mctx.monitor);
+        perf_xperf_state_destory(g_xperf_state);
+        exit(EXIT_FAILURE);
+    }
+    event_add(mctx.event, NULL);
+
+    xperf_monitor_init(mctx.monitor);
 
     LSQ_DEBUG("entering event loop");
 
     s = prog_run(&prog);
     prog_cleanup(&prog);
+
+    event_del(mctx.event);
+    event_free(mctx.event);
+    xperf_monitor_destory(mctx.monitor);
+    perf_xperf_state_destory(g_xperf_state);
 
     exit(0 == s ? EXIT_SUCCESS : EXIT_FAILURE);
 }

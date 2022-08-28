@@ -34,6 +34,8 @@
 #include "../src/liblsquic/lsquic_int_types.h"
 #include "../src/liblsquic/lsquic_byteswap.h"
 
+#include "../xperf/xperf_parser.h"
+
 struct scenario
 {
     STAILQ_ENTRY(scenario)  next;
@@ -48,6 +50,8 @@ static STAILQ_HEAD(, scenario) s_scenarios
                                     = STAILQ_HEAD_INITIALIZER(s_scenarios);
 static unsigned s_n_scenarios;
 static unsigned s_n_conns;
+
+static const char *s_dirname;
 
 struct prog s_prog;
 
@@ -124,7 +128,14 @@ struct lsquic_stream_ctx
     struct {
         uint64_t        n_read;
     }                       read_state;
+    struct xperf_parser    *parser;
 };
+
+
+static ssize_t perf_read_wrapper(void *ctx, void *buf, size_t len)
+{
+    return lsquic_stream_read((lsquic_stream_t *)ctx, buf, len);
+}
 
 
 static struct lsquic_stream_ctx *
@@ -154,6 +165,8 @@ perf_client_on_new_stream (void *stream_if_ctx, lsquic_stream_t *stream)
 #else
     stream_ctx->write_state.header = stream_ctx->scenario->bytes_to_request;
 #endif
+    stream_ctx->parser = xperf_parser_create(s_dirname, &perf_read_wrapper, stream);
+    assert(stream_ctx->parser);
     lsquic_stream_wantwrite(stream, 1);
     return stream_ctx;
 }
@@ -244,21 +257,13 @@ perf_client_on_write (struct lsquic_stream *stream,
 }
 
 
-static size_t
-perf_read_and_discard (void *user_data, const unsigned char *buf,
-                                                        size_t count, int fin)
-{
-    return count;
-}
-
-
 static void
 perf_client_on_read (struct lsquic_stream *stream,
                                         struct lsquic_stream_ctx *stream_ctx)
 {
     ssize_t nr;
 
-    nr = lsquic_stream_readf(stream, perf_read_and_discard, NULL);
+    nr = xperf_parser_process(stream_ctx->parser);
     if (nr >= 0)
     {
         stream_ctx->read_state.n_read += nr;
@@ -317,6 +322,8 @@ usage (const char *prog)
 "Usage: %s [opts]\n"
 "\n"
 "Options:\n"
+"   -d DIR      Put server-side files into DIR.  If not specified, use the\n"
+"                 current working directory.\n"
 "   -p NREQ:NSEND   Request NREQ bytes from server and, in addition, send\n"
 "                     NSEND bytes to server.  May be specified many times\n"
 "                     and must be specified at least once.\n"
@@ -338,7 +345,8 @@ main (int argc, char **argv)
     s_prog.prog_api.ea_alpn = "perf";
     s_prog.prog_settings.es_delay_onclose = 1;
 
-    while (-1 != (opt = getopt(argc, argv, PROG_OPTS "hp:T:")))
+    s_dirname = NULL;
+    while (-1 != (opt = getopt(argc, argv, PROG_OPTS "hp:T:d:")))
     {
         switch (opt) {
         case 'p':
@@ -370,6 +378,9 @@ main (int argc, char **argv)
                     exit(1);
                 }
             }
+            break;
+        case 'd':
+            s_dirname = optarg;
             break;
         case 'h':
             usage(argv[0]);

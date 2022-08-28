@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/queue.h>
+#include <errno.h>
 
 #include "lsquic.h"
 #include "lsquic_int_types.h"
@@ -32,10 +33,13 @@
 #include "lsquic_crand.h"
 #include "lsquic_mm.h"
 #include "lsquic_engine_public.h"
+#include "lsquic_xperf.h"
 
 #define LSQUIC_LOGGER_MODULE LSQLM_BBR
 #define LSQUIC_LOG_CONN_ID lsquic_conn_log_cid(bbr->bbr_conn_pub->lconn)
 #include "lsquic_logger.h"
+
+#include "../../xperf/xperf_quic.h"
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -129,6 +133,9 @@ static const size_t kGainCycleLength = sizeof(kPacingGain)
 #define kCwndGain 2.0
 
 
+struct lsquic_xperf_state *g_xperf_state;
+
+
 static uint64_t lsquic_bbr_get_cwnd (void *);
 
 
@@ -139,6 +146,80 @@ static const char *const mode2str[] =
     [BBR_MODE_PROBE_BW]  = "PROBE_BW",
     [BBR_MODE_PROBE_RTT] = "PROBE_RTT",
 };
+
+
+static void
+lsquic_xperf_put_data (struct lsquic_bbr *bbr, lsquic_time_t now)
+{
+    struct lsquic_xperf_chunk *header;
+    struct xperf_quic_data_record *record;
+
+    header = malloc(sizeof(struct lsquic_xperf_chunk) + sizeof(struct xperf_quic_data_record));
+    if (!header)
+    {
+        fprintf(stderr, "lsquic_xperf_put_data: malloc: Out of memory");
+        return;
+    }
+
+    record = (struct xperf_quic_data_record *)&header->chunk[0];
+
+    record->magic[0] = XPERF_QUIC_DATA_MAGIC0;
+    record->magic[1] = XPERF_QUIC_DATA_MAGIC1;
+    record->magic[2] = XPERF_QUIC_DATA_MAGIC2;
+
+    record->stamp = now + g_xperf_state->stamp_off;
+    record->min_rtt = bbr->bbr_min_rtt;
+    record->blt_bw = minmax_get(&bbr->bbr_max_bandwidth);
+    record->snd_cwnd = bbr->bbr_cwnd;
+
+    errno = 0;
+    if (fwrite(&record->magic + 1,
+               sizeof(*record) - sizeof(record->magic),
+               1,
+               g_xperf_state->fp_qdat) != 1)
+    {
+        LSQ_ERROR("lsquic_xperf_put_data: fwrite: %s",
+                  errno ? strerror(errno) : "End of file");
+    }
+
+    STAILQ_INSERT_TAIL(&g_xperf_state->chunks, header, next);
+}
+
+
+static void
+lsquic_xperf_put_ack (struct lsquic_bbr *bbr, lsquic_time_t now, uint32_t rtt)
+{
+    struct lsquic_xperf_chunk *header;
+    struct xperf_quic_ack_record *record;
+
+    header = malloc(sizeof(struct lsquic_xperf_chunk) + sizeof(struct xperf_quic_ack_record));
+    if (!header)
+    {
+        LSQ_ERROR("lsquic_xperf_put_ack: malloc: Out of memory");
+        return;
+    }
+
+    record = (struct xperf_quic_ack_record *)&header->chunk[0];
+
+    record->magic[0] = XPERF_QUIC_ACK_MAGIC0;
+    record->magic[1] = XPERF_QUIC_ACK_MAGIC1;
+    record->magic[2] = XPERF_QUIC_ACK_MAGIC2;
+
+    record->stamp = now + g_xperf_state->stamp_off;
+    record->rtt = rtt;
+
+    errno = 0;
+    if (fwrite(&record->magic + 1,
+               sizeof(*record) - sizeof(record->magic),
+               1,
+               g_xperf_state->fp_qack) != 1)
+    {
+        LSQ_ERROR("lsquic_xperf_put_data: fwrite: %s",
+                  errno ? strerror(errno) : "End of file");
+    }
+
+    STAILQ_INSERT_TAIL(&g_xperf_state->chunks, header, next);
+}
 
 
 static void
@@ -351,6 +432,9 @@ lsquic_bbr_ack (void *cong_ctl, struct lsquic_packet_out *packet_out,
             || packet_out->po_packno > bbr->bbr_ack_state.max_packno)
         bbr->bbr_ack_state.max_packno = packet_out->po_packno;
     bbr->bbr_ack_state.acked_bytes += packet_sz;
+
+    if (g_xperf_state != NULL && sample != NULL)
+        lsquic_xperf_put_ack(bbr, now_time, sample->rtt);
 }
 
 
@@ -400,6 +484,9 @@ lsquic_bbr_begin_ack (void *cong_ctl, lsquic_time_t ack_time, uint64_t in_flight
     bbr->bbr_ack_state.in_flight = in_flight;
     bbr->bbr_ack_state.total_bytes_acked_before
                         = lsquic_bw_sampler_total_acked(&bbr->bbr_bw_sampler);
+
+    if (g_xperf_state != NULL)
+        lsquic_xperf_put_data(bbr, ack_time);
 }
 
 

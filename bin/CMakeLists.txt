@@ -32,8 +32,8 @@ add_executable(echo_server echo_server.c prog.c test_common.c test_cert.c)
 add_executable(echo_client echo_client.c prog.c test_common.c test_cert.c)
 add_executable(duck_server duck_server.c prog.c test_common.c test_cert.c)
 add_executable(duck_client duck_client.c prog.c test_common.c test_cert.c)
-add_executable(perf_client perf_client.c prog.c test_common.c test_cert.c)
-add_executable(perf_server perf_server.c prog.c test_common.c test_cert.c)
+add_executable(perf_client perf_client.c prog.c test_common.c test_cert.c ../xperf/xperf_parser.c)
+add_executable(perf_server perf_server.c prog.c test_common.c test_cert.c ../xperf/xperf_monitor.c)
 
 
 IF (NOT MSVC)
